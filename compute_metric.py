@@ -7,20 +7,20 @@ import time
 from bert_score import score
 import nltk
 import numpy as np
-from datasets import load_metric
+import evaluate
 
 logger = logging.getLogger(__name__)
 
 
 class MetricCompute:
-    rouge_metric = load_metric('metrics/rouge.py')
-
     def __init__(self, data_args, tokenizer, test_dataset, eval_datatset):
         self.data_args = data_args
         self.tokenizer = tokenizer
         self.test_dataset = test_dataset
         self.eval_dataset = eval_datatset
         self.trainer = None
+        # Initialize ROUGE metric using evaluate library
+        self.rouge_metric = evaluate.load('rouge')
 
     def postprocess_text(self, metric_name, preds, labels):
         preds = [pred.strip() for pred in preds]
@@ -91,26 +91,57 @@ class MetricCompute:
                 fo_show.write(f'{inp_str.replace(" ", "")}\n{lab}\n{pred}\n{"-" * 20}\n')
             else:
                 fo_show.write(f'{inp_str}\n{lab}\n{pred}\n{"-" * 20}\n')
+        
+        fo_ref.close()
+        fo_dec.close()
+        fo_show.close()
+        
         result = {}
-        # evaluate rouge
-        P, R, F1 =score(decoded_preds, decoded_labels, lang='en', verbose=True)
-        F1=F1.mean().item()
-        rouge_decoded_preds, rouge_decoded_labels = self.postprocess_text('rouge', decoded_preds, decoded_labels)
-        rouge_result = self.rouge_metric.compute(predictions=rouge_decoded_preds, references=rouge_decoded_labels,
-                                                 use_stemmer=True)
-        # Extract a few results from ROUGE
-        result.update({key: value.mid.fmeasure * 100 for key, value in rouge_result.items()})
+        
+        # Evaluate BERTScore
+        try:
+            # Determine language for BERTScore
+            lang = 'zh' if self.data_args.chinese_data else 'en'
+            P, R, F1 = score(decoded_preds, decoded_labels, lang=lang, verbose=True)
+            F1 = F1.mean().item()
+            result['bertscore'] = F1
+        except Exception as e:
+            logger.warning(f"BERTScore computation failed: {e}")
+            result['bertscore'] = 0.0
+        
+        # Evaluate ROUGE using the new evaluate library
+        try:
+            rouge_decoded_preds, rouge_decoded_labels = self.postprocess_text('rouge', decoded_preds, decoded_labels)
+            rouge_result = self.rouge_metric.compute(
+                predictions=rouge_decoded_preds, 
+                references=rouge_decoded_labels,
+                use_stemmer=True
+            )
+            
+            # Extract ROUGE scores - note the different format in evaluate library
+            for key, value in rouge_result.items():
+                if key.startswith('rouge'):
+                    result[key] = round(value * 100, 4)  # Convert to percentage
+        except Exception as e:
+            logger.warning(f"ROUGE computation failed: {e}")
+            # Set default ROUGE scores
+            result.update({
+                'rouge1': 0.0,
+                'rouge2': 0.0,
+                'rougeL': 0.0,
+                'rougeLsum': 0.0
+            })
 
         prediction_lens = [np.count_nonzero(pred != self.tokenizer.pad_token_id) for pred in preds]
         result["gen_len"] = np.mean(prediction_lens)
         result = {k: round(v, 4) for k, v in result.items()}
         result['global_step'] = self.trainer.state.global_step
         result['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-        result['bertscore']=F1
-        data_name=self.data_args.save_dataset_path.split('/')[-1]
-        result['data_name'] =data_name
-        result['data_num'] =self.data_args.max_val_samples
-        result['val_max_target_length'] =self.data_args.val_max_target_length
+        
+        data_name = self.data_args.save_dataset_path.split('/')[-1]
+        result['data_name'] = data_name
+        result['data_num'] = self.data_args.max_val_samples
+        result['val_max_target_length'] = self.data_args.val_max_target_length
 
         fo_score = open(os.path.join(self.data_args.log_root, 'scores.txt'), 'a+', encoding='utf8')
         fo_score.write(f'{json.dumps(result)}\n')
