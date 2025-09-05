@@ -59,7 +59,7 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, my_Seq2SeqTrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()  # type: ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses() 
     training_args.logging_steps = 10
     data_args.log_root = os.path.join(data_args.log_root, data_args.proj_name, data_args.exp_name)
 
@@ -121,7 +121,7 @@ def main():
         model_args.model_name_or_path = last_checkpoint
 
     logger.info(f'******* Loading model form pretrained {model_args.model_name_or_path} **********')
-    tokenizer = BartTokenizer.from_pretrained('facebook/bart-large')  # 如果用bart-base就用这行
+    tokenizer = BartTokenizer.from_pretrained(model_args.model_name_or_path)  # 如果用bart-base就用这行
     logger.info('load BartTokenizer')
 
     config = BartConfig.from_pretrained(model_args.model_name_or_path)
@@ -135,6 +135,11 @@ def main():
     config.moe_load = training_args.moe_load
     config.share_importance = model_args.share_importance
     config.keep_resident = model_args.keep_resident
+
+    # Thêm dòng này cho MoEBERT
+    config.moebert_load_experts = training_args.moe_load
+    config.moebert = model_args.moe_model
+    
     training_args.margin_loss = model_args.margin_loss
 
     model = MyBart.from_pretrained(model_args.model_name_or_path,config=config)
@@ -285,8 +290,6 @@ def main():
         #         fo_ref = open(os.path.join(dec_dir, 'reference.txt'), 'w', encoding='utf8')
         #         fo_dec = open(os.path.join(dec_dir, 'decoded.txt'), 'w', encoding='utf8')
         #         for pred, lab in zip(test_preds, test_labels):
-        #             fo_ref.write(f'{lab}\n')
-        #             fo_dec.write(f'{pred}\n')
 
 
 def _mp_fn(index):

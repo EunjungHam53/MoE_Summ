@@ -47,15 +47,8 @@ from transformers.moebert.utils import (
     MoEModelOutput,
     MoEModelOutputWithPooling,
 )
-from transformers.moebert.utils_enc import (
-    FeedForward_enc,
-    ImportanceProcessor_enc,
-    MoEModelOutput_enc,
-    MoEModelOutputWithPooling_enc,
-    use_experts_enc,
-)
+
 from transformers.moebert.moe_layer import MoELayer
-from transformers.moebert.moe_layer_enc import MoELayer_enc
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +79,11 @@ class MyBartEncoder(BartPretrainedModel):
 
         self.gradient_checkpointing = False
         self.post_init()
+
+    def post_init(self):
+        """Initialize weights and apply final processing."""
+        # Cho pretrained model, chỉ cần pass hoặc gọi parent
+        super().post_init() if hasattr(super(), 'post_init') else None
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -217,6 +215,11 @@ class MyMoeEncoder(BartPretrainedModel):
 
         self.gradient_checkpointing = False
         self.post_init()
+
+    def post_init(self):
+        """Initialize weights and apply final processing."""
+        # Cho pretrained model, chỉ cần pass hoặc gọi parent
+        super().post_init() if hasattr(super(), 'post_init') else None
 
     def get_input_embeddings(self):
         return self.embed_tokens
