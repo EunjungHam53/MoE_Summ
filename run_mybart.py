@@ -1,3 +1,4 @@
+from pathlib import Path
 #!/usr/bin/env python
 # coding=utf-8
 """
@@ -270,26 +271,35 @@ def main():
         )
         print(test_results.metrics)
 
-        # if trainer.is_world_process_zero():
-        #     if training_args.predict_with_generate:
-        #         test_results.label_ids[test_results.label_ids < 0] = tokenizer.pad_token_id
-        #         test_label = tokenizer.batch_decode(
-        #             test_results.label_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
-        #         )
-        #         test_preds = tokenizer.batch_decode(
-        #             test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
-        #         )
-        #         test_preds = [pred.strip() for pred in test_preds]
-        #         test_labels = [label.strip() for label in test_label]
-        #         # for pred, lab in zip(test_preds[:10], test_labels[:10]):
-        #         #     logger.info(f'{pred}\t{lab}')
-        #
-        #         dec_dir = os.path.join(data_args.log_root, f'decode-{trainer.state.global_step}')
-        #         if not os.path.exists(dec_dir):
-        #             os.makedirs(dec_dir)
-        #         fo_ref = open(os.path.join(dec_dir, 'reference.txt'), 'w', encoding='utf8')
-        #         fo_dec = open(os.path.join(dec_dir, 'decoded.txt'), 'w', encoding='utf8')
-        #         for pred, lab in zip(test_preds, test_labels):
+        if trainer.is_world_process_zero():
+            if training_args.predict_with_generate:
+                test_results.label_ids[test_results.label_ids < 0] = tokenizer.pad_token_id
+                test_label = tokenizer.batch_decode(
+                    test_results.label_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+                )
+                test_preds = tokenizer.batch_decode(
+                    test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
+                )
+                test_preds = [pred.strip() for pred in test_preds]
+                test_labels = [label.strip() for label in test_label]
+                
+                # In ra 10 ví dụ đầu để debug
+                for pred, lab in zip(test_preds[:10], test_labels[:10]):
+                    logger.info(f'PRED: {pred}')
+                    logger.info(f'GOLD: {lab}')
+                    logger.info('---')
+        
+                dec_dir = Path(data_args.log_root) / f'decode-{trainer.state.global_step}'
+                dec_dir.mkdir(parents=True, exist_ok=True)
+                
+                ref_file = dec_dir / 'reference.txt'
+                dec_file = dec_dir / 'decoded.txt'
+                
+                with ref_file.open('w', encoding='utf8') as fo_ref, \
+                     dec_file.open('w', encoding='utf8') as fo_dec:
+                    for pred, lab in zip(test_preds, test_labels):
+                        print(lab, file=fo_ref)
+                        print(pred, file=fo_dec)
 
 
 def _mp_fn(index):

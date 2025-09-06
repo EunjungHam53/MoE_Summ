@@ -1523,6 +1523,9 @@ class MyBart(BartPretrainedModel):
         r"lm_head\.weight",
     ]
 
+    # THÊM DÒNG NÀY ĐỂ FIX LỖI
+    _keys_to_ignore_on_save = [r"lm_head.weight"]
+
     def __init__(self, config: BartConfig):
         super().__init__(config)
 
