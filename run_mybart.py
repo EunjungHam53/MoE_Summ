@@ -7,6 +7,7 @@ Fine-tuning the library models for sequence to sequence.
 from args import ModelArguments, DataTrainingArguments, my_Seq2SeqTrainingArguments
 from compute_metric import MetricCompute
 from transformers.models.bart.tokenization_bart import BartTokenizer
+from transformers import AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers import (
     HfArgumentParser,
@@ -24,6 +25,7 @@ import logging
 import pdb
 import sys
 import traceback
+import torch
 # import comet
 from dataset_maker import DatasetMaker
 import glob
@@ -32,7 +34,6 @@ from transformers.models.bart.modeling_bart import (
     shift_tokens_right,
     BartConfig,
     BartPretrainedModel,
-    _expand_mask, _make_causal_mask,
     BartClassificationHead,
     BartLearnedPositionalEmbedding, BartAttention,
 )
@@ -43,9 +44,70 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+from transformers import GenerationConfig
+
 # from magic_bart import MyBart, MyCometCallback, AutoDecodeCallback, MyDataCollatorForSeq2Seq, MySeq2SeqTrainer,MyBartConfig
 
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: int = None):
+    """
+    Expands attention_mask from [batch_size, seq_len] to [batch_size, 1, tgt_len, seq_len]
+    for multi-head attention use.
+    
+    Args:
+        mask: [batch_size, src_len] - attention mask where 1 = attend, 0 = ignore
+        dtype: target data type
+        tgt_len: target sequence length (defaults to src_len if None)
+    
+    Returns:
+        expanded_mask: [batch_size, 1, tgt_len, src_len] 
+                      with -inf for positions to ignore, 0.0 for positions to attend
+    """
+    batch_size, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+    
+    # Expand dims: [batch_size, src_len] -> [batch_size, 1, 1, src_len]
+    expanded_mask = mask[:, None, None, :].to(dtype=dtype)
+    
+    # Expand to target shape: [batch_size, 1, tgt_len, src_len]
+    expanded_mask = expanded_mask.expand(batch_size, 1, tgt_len, src_len)
+    
+    # Invert mask: 1 becomes 0 (attend), 0 becomes 1 (ignore)
+    inverted_mask = 1.0 - expanded_mask
+    
+    # Replace 1s (ignore positions) with -inf, keep 0s (attend positions) as 0
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
+
+def _make_causal_mask(input_ids_shape, dtype: torch.dtype, past_key_values_length: int = 0):
+    """
+    Creates a causal (lower triangular) attention mask.
+    
+    Args:
+        input_ids_shape: (batch_size, seq_len)
+        dtype: target data type
+        past_key_values_length: length of cached keys/values
+    
+    Returns:
+        causal_mask: [batch_size, 1, seq_len, seq_len + past_key_values_length]
+                    with -inf for future positions, 0.0 for valid positions
+    """
+    batch_size, tgt_len = input_ids_shape
+    
+    # Create causal mask matrix - không cần device parameter vì sẽ .to(device) sau
+    mask = torch.full((tgt_len, tgt_len), float('-inf'), dtype=dtype)
+    
+    # Fill lower triangle (including diagonal) với 0s
+    mask = torch.triu(mask, diagonal=1)  # Upper triangular với -inf, lower triangle với 0
+    
+    # Handle past key values length
+    if past_key_values_length > 0:
+        # Thêm zeros cho past keys/values
+        past_mask = torch.zeros(tgt_len, past_key_values_length, dtype=dtype)
+        mask = torch.cat([past_mask, mask], dim=-1)
+    
+    # Expand to batch dimension: [batch_size, 1, tgt_len, tgt_len + past_key_values_length]
+    return mask[None, None, :, :].expand(batch_size, 1, tgt_len, tgt_len + past_key_values_length)
+    
 logger = logging.getLogger(__name__)
 
 try:
@@ -122,10 +184,12 @@ def main():
         model_args.model_name_or_path = last_checkpoint
 
     logger.info(f'******* Loading model form pretrained {model_args.model_name_or_path} **********')
-    tokenizer = BartTokenizer.from_pretrained(model_args.model_name_or_path)  # 如果用bart-base就用这行
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)  # 如果用bart-base就用这行
     logger.info('load BartTokenizer')
 
     config = BartConfig.from_pretrained(model_args.model_name_or_path)
+    config.vocab_size = 64001  # Thêm dòng này để khớp với checkpoint
+    
     config.intermediate_size = model_args.intermediate_size
     config.route_method = model_args.route_method
     config.num_experts = model_args.num_experts
@@ -137,12 +201,17 @@ def main():
     config.share_importance = model_args.share_importance
     config.keep_resident = model_args.keep_resident
 
+    # Đảm bảo vocab_size đúng (BARTPho-word-base = 50265)
+    config.vocab_size = tokenizer.vocab_size
+
     # Thêm dòng này cho MoEBERT
     config.moebert_load_experts = training_args.moe_load
     config.moebert = model_args.moe_model
     
     training_args.margin_loss = model_args.margin_loss
-
+    
+    if hasattr(config, 'vocab_size'):
+        config.vocab_size = 64001
     model = MyBart.from_pretrained(model_args.model_name_or_path,config=config)
 
     logger.info('load model')
@@ -183,8 +252,21 @@ def main():
 
     # comet_callback = MyCometCallback(data_args.proj_name, data_args.exp_name)
 
-    model.config.num_beams = data_args.num_beams
-    model.config.max_length = data_args.max_target_length
+    # model.config.num_beams = data_args.num_beams
+    # model.config.max_length = data_args.max_target_length
+
+    
+
+    # Thay vì set trong model config
+    generation_config = GenerationConfig(
+        max_length=data_args.max_target_length,
+        num_beams=data_args.num_beams,
+        decoder_start_token_id=tokenizer.bos_token_id or 0,
+        pad_token_id=tokenizer.pad_token_id or 1,
+        eos_token_id=tokenizer.eos_token_id or 2
+    )
+    model.generation_config = generation_config
+        
 
     # for param in model.bart.parameters():
     #     param.requires_grad = False
@@ -252,8 +334,8 @@ def main():
             if trainer.is_world_process_zero():
                 logger.info('exit, saving model')
                 # pdb.set_trace()
-                trainer.save_model(output_dir=os.path.join(training_args.output_dir,
-                                                           f'checkpoint-{trainer.state.global_step}'))  # Saves the tokenizer too for easy upload
+                trainer.save_model(output_dir=os.path.join(training_args.output_dir, f'checkpoint-{trainer.state.global_step}'))  # Saves the tokenizer too for easy upload
+                # tokenizer.save_pretrained(os.path.join(training_args.output_dir, f'checkpoint-{trainer.state.global_step}'))
                 trainer.state.save_to_json(
                     os.path.join(training_args.output_dir, f'checkpoint-{trainer.state.global_step}',
                                  'trainer_state.json'))

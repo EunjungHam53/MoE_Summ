@@ -1,3 +1,4 @@
+import torch
 import collections
 import logging
 import math
@@ -14,6 +15,7 @@ from transformers import BartTokenizer
 from transformers import PreTrainedTokenizerBase
 from transformers.file_utils import ModelOutput
 from transformers.tokenization_utils_base import PaddingStrategy
+from transformers import GenerationMixin
 
 # from comet import MyExperiment
 import torch
@@ -37,7 +39,6 @@ from transformers.models.bart.modeling_bart import (
     shift_tokens_right,
     BartConfig,
     BartPretrainedModel,
-    _expand_mask, _make_causal_mask,
     BartClassificationHead,
     BartLearnedPositionalEmbedding, BartAttention,
 )
@@ -48,10 +49,69 @@ from transformers.moebert.utils import (
     MoEModelOutputWithPooling,
 )
 
-from transformers.moebert.moe_layer import MoELayer
+# from transformers.moebert.moe_layer import MoELayer
 
 logger = logging.getLogger(__name__)
 
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: int = None):
+    """
+    Expands attention_mask from [batch_size, seq_len] to [batch_size, 1, tgt_len, seq_len]
+    for multi-head attention use.
+    
+    Args:
+        mask: [batch_size, src_len] - attention mask where 1 = attend, 0 = ignore
+        dtype: target data type
+        tgt_len: target sequence length (defaults to src_len if None)
+    
+    Returns:
+        expanded_mask: [batch_size, 1, tgt_len, src_len] 
+                      with -inf for positions to ignore, 0.0 for positions to attend
+    """
+    batch_size, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+    
+    # Expand dims: [batch_size, src_len] -> [batch_size, 1, 1, src_len]
+    expanded_mask = mask[:, None, None, :].to(dtype=dtype)
+    
+    # Expand to target shape: [batch_size, 1, tgt_len, src_len]
+    expanded_mask = expanded_mask.expand(batch_size, 1, tgt_len, src_len)
+    
+    # Invert mask: 1 becomes 0 (attend), 0 becomes 1 (ignore)
+    inverted_mask = 1.0 - expanded_mask
+    
+    # Replace 1s (ignore positions) with -inf, keep 0s (attend positions) as 0
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+
+
+def _make_causal_mask(input_ids_shape, dtype: torch.dtype, past_key_values_length: int = 0):
+    """
+    Creates a causal (lower triangular) attention mask.
+    
+    Args:
+        input_ids_shape: (batch_size, seq_len)
+        dtype: target data type
+        past_key_values_length: length of cached keys/values
+    
+    Returns:
+        causal_mask: [batch_size, 1, seq_len, seq_len + past_key_values_length]
+                    with -inf for future positions, 0.0 for valid positions
+    """
+    batch_size, tgt_len = input_ids_shape
+    
+    # Create causal mask matrix - không cần device parameter vì sẽ .to(device) sau
+    mask = torch.full((tgt_len, tgt_len), float('-inf'), dtype=dtype)
+    
+    # Fill lower triangle (including diagonal) với 0s
+    mask = torch.triu(mask, diagonal=1)  # Upper triangular với -inf, lower triangle với 0
+    
+    # Handle past key values length
+    if past_key_values_length > 0:
+        # Thêm zeros cho past keys/values
+        past_mask = torch.zeros(tgt_len, past_key_values_length, dtype=dtype)
+        mask = torch.cat([past_mask, mask], dim=-1)
+    
+    # Expand to batch dimension: [batch_size, 1, tgt_len, tgt_len + past_key_values_length]
+    return mask[None, None, :, :].expand(batch_size, 1, tgt_len, tgt_len + past_key_values_length)
 
 class MyBartEncoder(BartPretrainedModel):
     def __init__(self, config: BartConfig, embed_tokens: Optional[nn.Embedding] = None):
@@ -122,7 +182,8 @@ class MyBartEncoder(BartPretrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
 
-        embed_pos = self.embed_positions(input_shape)
+        positions = torch.arange(0, input_shape[-1], dtype=torch.long, device=inputs_embeds.device)
+        embed_pos = self.embed_positions(positions.unsqueeze(0).expand(input_shape[0], -1))
 
         hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
@@ -258,7 +319,8 @@ class MyMoeEncoder(BartPretrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
 
-        embed_pos = self.embed_positions(input_shape)
+        positions = torch.arange(0, input_shape[-1], dtype=torch.long, device=inputs_embeds.device)
+        embed_pos = self.embed_positions(positions.unsqueeze(0).expand(input_shape[0], -1))
 
         hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
@@ -462,26 +524,44 @@ class MyMoeEncoderLayer(nn.Module):
                 expert_list[i].append(torch.cat([self.fc1.weight, self.experts_fc1[i].weight], 0))  # fc1 weight
                 expert_list[i].append(torch.cat([self.fc1.bias, self.experts_fc1[i].bias], 0))
                 expert_list[i].append(torch.cat([self.fc2.weight, self.experts_fc2[i].weight], 1))
-
+    
         bsz, seq_len, dim = x.size()
+        original_shape = (bsz, seq_len, dim)
         x = x.view(-1, dim)
-        if idxes.size()[0] != bsz:
-            idxes = idxes.unsqueeze(-1)  # 32,1
-            idxes = idxes.repeat([1, self.config.num_beams])  # 32,beam
-            idxes = idxes.view(-1)
-        idxes = idxes.unsqueeze(-1)  # 32,1
-        idxes = idxes.repeat([1, seq_len])  # batch,seq_len
-        idxes = idxes.view(-1)
+        total_tokens = x.size(0)  # Should be bsz * seq_len
+    
+        # Fix: Handle idxes dimension mismatch
+        if idxes.size(0) != bsz:
+            # During beam search or other scenarios, batch size may differ
+            if hasattr(self.config, 'num_beams') and self.config.num_beams > 1:
+                # Assume idxes corresponds to original batch size
+                original_batch_size = idxes.size(0)
+                num_beams = bsz // original_batch_size
+                idxes = idxes.unsqueeze(-1).repeat(1, num_beams).view(-1)
+            else:
+                # Fallback: repeat or truncate idxes to match bsz
+                if idxes.size(0) < bsz:
+                    repeat_times = (bsz + idxes.size(0) - 1) // idxes.size(0)  # Ceiling division
+                    idxes = idxes.repeat(repeat_times)[:bsz]
+                else:
+                    idxes = idxes[:bsz]
+        
+        # Expand idxes to match total tokens
+        idxes = idxes.unsqueeze(-1).repeat(1, seq_len).view(-1)
+        
+        # Verify dimensions match
+        assert idxes.size(0) == total_tokens, f"idxes size {idxes.size(0)} != total_tokens {total_tokens}"
+        
         order = idxes.argsort(0)
-
+    
         num_tokens = F.one_hot(idxes, self.config.num_datasets).gt(0).sum(0)
         x_for_gate = x[order]
         x_for_gate = x_for_gate.split(num_tokens.tolist(), dim=0)
-        gate = torch.empty(0).to('cuda')
-        gate_value = torch.empty(0).to('cuda')
-
+        gate = torch.empty(0, device=x.device, dtype=torch.long)
+        gate_value = torch.empty(0, device=x.device)
+    
         for i in range(self.config.num_datasets):
-            if x_for_gate[i].size()[0] != 0:
+            if x_for_gate[i].size(0) != 0:
                 hidden_states = self.gate_weight[i](x_for_gate[i])
                 hidden_states = F.softmax(hidden_states, -1)  # case_num,expert_num
                 select_gate_value = torch.topk(hidden_states, 1, 1)[0].squeeze(-1)
@@ -490,16 +570,19 @@ class MyMoeEncoderLayer(nn.Module):
                 gate_value = torch.cat([gate_value, select_gate_value])
         gate = gate[order.argsort(0)].to(torch.int64)
         gate_value = gate_value[order.argsort(0)]
-
+    
         ##################
         order = gate.argsort(0)
         num_tokens = F.one_hot(gate, self.config.num_experts).gt(0).sum(0)
-        x = x[order]  # reorder according to expert number [200, 768]
+        x = x[order]  # reorder according to expert number
         gate_value = gate_value[order]
         x = x.split(num_tokens.tolist(), dim=0)  # a list of length self.num_experts
         gate_value = gate_value.split(num_tokens.tolist(), dim=0)
         new_x = []
         for i in range(self.config.num_experts):
+            if x[i].size(0) == 0:  # Skip empty expert
+                continue
+                
             residual = x[i]  # batch, d_model
             hidden_states = self.activation_fn(
                 F.linear(x[i], expert_list[i][0], expert_list[i][1]))  # batch,intermediate
@@ -510,10 +593,14 @@ class MyMoeEncoderLayer(nn.Module):
             hidden_states = self.final_layer_norm(hidden_states)
             hidden_states = hidden_states * (gate_value[i].unsqueeze(-1))
             new_x.append(hidden_states)
-
+    
         x = torch.vstack(new_x)
         x = x[order.argsort(0)]  # restore original order
-        x = x.view(bsz, seq_len, dim)
+        
+        # Ensure we have the right number of elements before reshaping
+        assert x.size(0) == total_tokens, f"Final tensor size {x.size(0)} != expected {total_tokens}"
+        x = x.view(original_shape)
+        
         return x, gate
 
 
@@ -692,7 +779,17 @@ class MyBartDecoder(BartPretrainedModel):
         #     addi_source_encoder_attention_mask = _expand_mask(addi_source_encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
         # embed positions
-        positions = self.embed_positions(input_shape, past_key_values_length)
+        # positions = self.embed_positions(input_shape, past_key_values_length)
+
+        seq_length = input_shape[-1]
+        position_ids = torch.arange(
+            past_key_values_length, 
+            seq_length + past_key_values_length, 
+            dtype=torch.long, 
+            device=inputs_embeds.device
+        ).unsqueeze(0).expand(input_shape[0], -1)
+        
+        positions = self.embed_positions(position_ids)
 
         hidden_states = inputs_embeds + positions
         hidden_states = self.layernorm_embedding(hidden_states)
@@ -896,7 +993,17 @@ class MyMoeDecoder(BartPretrainedModel):
         #     addi_source_encoder_attention_mask = _expand_mask(addi_source_encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
         # embed positions
-        positions = self.embed_positions(input_shape, past_key_values_length)
+        # positions = self.embed_positions(input_shape, past_key_values_length)
+
+        seq_length = input_shape[-1]
+        position_ids = torch.arange(
+            past_key_values_length, 
+            seq_length + past_key_values_length, 
+            dtype=torch.long, 
+            device=inputs_embeds.device
+        ).unsqueeze(0).expand(input_shape[0], -1)
+        
+        positions = self.embed_positions(position_ids)
 
         hidden_states = inputs_embeds + positions
         hidden_states = self.layernorm_embedding(hidden_states)
@@ -965,12 +1072,23 @@ class MyMoeDecoder(BartPretrainedModel):
                     use_cache=use_cache,
                     idxes=idxes
                 )
-            hidden_states = layer_outputs[0]
-            ori_hidden_states = layer_outputs[1]
+            # hidden_states = layer_outputs[0]
+            # ori_hidden_states = layer_outputs[1]
 
+            # if use_cache:
+            #     # next_decoder_cache += (layer_outputs[3 if output_attentions else 1],)
+            #     next_decoder_cache += (layer_outputs[3 if output_attentions else 2],)
+
+            hidden_states = layer_outputs[0]
+            if len(layer_outputs) > 1:
+                ori_hidden_states = layer_outputs[1]
+            else:
+                ori_hidden_states = None
+            
+            # Xử lý cache index đúng cách
             if use_cache:
-                # next_decoder_cache += (layer_outputs[3 if output_attentions else 1],)
-                next_decoder_cache += (layer_outputs[3 if output_attentions else 2],)
+                cache_index = len(layer_outputs) - 1  # present_key_value luôn là element cuối
+                next_decoder_cache += (layer_outputs[cache_index],)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1207,7 +1325,11 @@ class MyMoeDecoderLayer(nn.Module):
             hidden_states = self.encoder_attn_layer_norm(hidden_states)
 
             # add cross-attn to positions 3,4 of present_key_value tuple
-            present_key_value = present_key_value + cross_attn_present_key_value
+            # FIX: Check if present_key_value and cross_attn_present_key_value are not None
+            if present_key_value is not None and cross_attn_present_key_value is not None:
+                present_key_value = present_key_value + cross_attn_present_key_value
+            elif cross_attn_present_key_value is not None:
+                present_key_value = cross_attn_present_key_value
 
         if self.config.margin_loss:
             # Fully Connected
@@ -1241,27 +1363,44 @@ class MyMoeDecoderLayer(nn.Module):
                 expert_list[i].append(torch.cat([self.fc1.weight, self.experts_fc1[i].weight], 0))  # fc1 weight
                 expert_list[i].append(torch.cat([self.fc1.bias, self.experts_fc1[i].bias], 0))
                 expert_list[i].append(torch.cat([self.fc2.weight, self.experts_fc2[i].weight], 1))
-
+    
         bsz, seq_len, dim = x.size()
+        original_shape = (bsz, seq_len, dim)
         x = x.view(-1, dim)
-
-        if idxes.size()[0] != bsz:
-            idxes = idxes.unsqueeze(-1)  # 32,1
-            idxes = idxes.repeat([1, self.config.num_beams])  # 32,beam
-            idxes = idxes.view(-1)
-        idxes = idxes.unsqueeze(-1)  # 32,1
-        idxes = idxes.repeat([1, seq_len])  # batch,seq_len
-        idxes = idxes.view(-1)
+        total_tokens = x.size(0)  # Should be bsz * seq_len
+    
+        # Fix: Handle idxes dimension mismatch during beam search
+        if idxes.size(0) != bsz:
+            # During beam search, batch size is multiplied by num_beams
+            if hasattr(self.config, 'num_beams') and self.config.num_beams > 1:
+                # Assume idxes corresponds to original batch size
+                original_batch_size = idxes.size(0)
+                num_beams = bsz // original_batch_size
+                idxes = idxes.unsqueeze(-1).repeat(1, num_beams).view(-1)
+            else:
+                # Fallback: repeat or truncate idxes to match bsz
+                if idxes.size(0) < bsz:
+                    repeat_times = (bsz + idxes.size(0) - 1) // idxes.size(0)  # Ceiling division
+                    idxes = idxes.repeat(repeat_times)[:bsz]
+                else:
+                    idxes = idxes[:bsz]
+        
+        # Expand idxes to match total tokens
+        idxes = idxes.unsqueeze(-1).repeat(1, seq_len).view(-1)
+        
+        # Verify dimensions match
+        assert idxes.size(0) == total_tokens, f"idxes size {idxes.size(0)} != total_tokens {total_tokens}"
+        
         order = idxes.argsort(0)
-
+    
         num_tokens = F.one_hot(idxes, self.config.num_datasets).gt(0).sum(0)
         x_for_gate = x[order]
         x_for_gate = x_for_gate.split(num_tokens.tolist(), dim=0)
-        gate = torch.empty(0).to('cuda')
-        gate_value = torch.empty(0).to('cuda')
-
+        gate = torch.empty(0, device=x.device, dtype=torch.long)
+        gate_value = torch.empty(0, device=x.device)
+    
         for i in range(self.config.num_datasets):
-            if x_for_gate[i].size()[0] != 0:
+            if x_for_gate[i].size(0) != 0:
                 hidden_states = self.gate_weight[i](x_for_gate[i])
                 hidden_states = F.softmax(hidden_states, -1)  # case_num,expert_num
                 select_gate_value = torch.topk(hidden_states, 1, 1)[0].squeeze(-1)
@@ -1270,22 +1409,26 @@ class MyMoeDecoderLayer(nn.Module):
                 gate_value = torch.cat([gate_value, select_gate_value])
         gate = gate[order.argsort(0)].to(torch.int64)
         gate_value = gate_value[order.argsort(0)]
-
+    
         ##################
         order = gate.argsort(0)
         num_tokens = F.one_hot(gate, self.config.num_experts).gt(0).sum(0)
-        x = x[order]  # reorder according to expert number [200, 768]
+        x = x[order]  # reorder according to expert number
         gate_value = gate_value[order]
         x = x.split(num_tokens.tolist(), dim=0)  # a list of length self.num_experts
         gate_value = gate_value.split(num_tokens.tolist(), dim=0)
         new_x = []
         for i in range(self.config.num_experts):
+            if x[i].size(0) == 0:  # Skip empty expert
+                continue
+                
             residual = x[i]  # batch, d_model
             hidden_states = self.activation_fn(
                 F.linear(x[i], expert_list[i][0], expert_list[i][1]))  # batch,intermediate
             hidden_states = F.dropout(hidden_states, p=self.activation_dropout, training=self.training)
             hidden_states = F.linear(hidden_states, expert_list[i][2], self.fc2.bias)
             hidden_states = F.dropout(hidden_states, p=self.dropout, training=self.training)
+            
             if self.config.keep_resident:
                 hidden_states = hidden_states * (gate_value[i].unsqueeze(-1))
                 hidden_states = residual + hidden_states
@@ -1295,10 +1438,14 @@ class MyMoeDecoderLayer(nn.Module):
                 hidden_states = self.final_layer_norm(hidden_states)
                 hidden_states = hidden_states * (gate_value[i].unsqueeze(-1))
             new_x.append(hidden_states)
-
+    
         x = torch.vstack(new_x)
         x = x[order.argsort(0)]  # restore original order
-        x = x.view(bsz, seq_len, dim)
+        
+        # Ensure we have the right number of elements before reshaping
+        assert x.size(0) == total_tokens, f"Final tensor size {x.size(0)} != expected {total_tokens}"
+        x = x.view(original_shape)
+        
         return x, gate
 
 
@@ -1514,13 +1661,19 @@ class MyBartModel(BartPretrainedModel):
         )
 
 
-class MyBart(BartPretrainedModel):
+class MyBart(BartPretrainedModel, GenerationMixin):
     base_model_prefix = "model"
     _keys_to_ignore_on_load_missing = [
         r"final_logits_bias",
         r"encoder\.version",
         r"decoder\.version",
         r"lm_head\.weight",
+    ]
+
+    _tied_weights_keys = [
+        "model.encoder.embed_tokens.weight",
+        "model.decoder.embed_tokens.weight", 
+        "model.shared.weight"
     ]
 
     # THÊM DÒNG NÀY ĐỂ FIX LỖI
@@ -1532,6 +1685,8 @@ class MyBart(BartPretrainedModel):
         self.model = MyBartModel(config)
         self.register_buffer("final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings)))
         self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
+
+        # THÊM DÒNG NÀY để unshare weights
 
         self.init_weights()
 
@@ -1648,20 +1803,40 @@ class MyBart(BartPretrainedModel):
             zero_logits=zero_logits
         )
 
-    def _prepare_encoder_decoder_kwargs_for_generation(self, input_ids: torch.LongTensor, model_kwargs) -> Dict[
-        str, Any]:
+    def _prepare_encoder_decoder_kwargs_for_generation(
+        self, 
+        inputs_tensor: torch.Tensor, 
+        model_kwargs, 
+        model_input_name: Optional[str] = None,
+        generation_config = None
+    ) -> Dict[str, Any]:
         # retrieve encoder hidden states
         encoder = self.get_encoder()
+        # Prepare encoder kwargs by removing decoder-specific arguments
         encoder_kwargs = {
-            argument: value for argument, value in model_kwargs.items() if
-            not argument.startswith("decoder_") and not 'use_cache' in argument
+            argument: value for argument, value in model_kwargs.items() 
+            if not argument.startswith("decoder_") 
+            and argument not in ["use_cache", "output_attentions", "output_hidden_states"]
+            and not argument.startswith("cross_attn")
         }
-        # addi_source = model_kwargs['addi_source']
-        # addi_source_attention_mask = model_kwargs['addi_source_attention_mask']
-        # del encoder_kwargs['addi_source_attention_mask']
-        # del encoder_kwargs['addi_source']
-        model_kwargs["encoder_outputs"]: ModelOutput = encoder(input_ids, return_dict=True, **encoder_kwargs)
-        # model_kwargs["addi_source_encoder_outputs"]: ModelOutput = encoder(addi_source, attention_mask=addi_source_attention_mask, return_dict=True, output_attentions=model_kwargs['output_attentions'], output_hidden_states=model_kwargs['output_hidden_states'])
+        
+        # Handle the input tensor - could be input_ids or inputs_embeds
+        if model_input_name is None:
+            model_input_name = self.main_input_name
+        
+        encoder_kwargs[model_input_name] = inputs_tensor
+        
+        # Add standard generation arguments if they exist in model_kwargs
+        for key in ["attention_mask", "head_mask", "inputs_embeds", "output_attentions", "output_hidden_states"]:
+            if key in model_kwargs:
+                encoder_kwargs[key] = model_kwargs[key]
+        
+        # Add custom arguments specific to your model
+        if "idxes" in model_kwargs:
+            encoder_kwargs["idxes"] = model_kwargs["idxes"]
+        
+        model_kwargs["encoder_outputs"] = encoder(return_dict=True, **encoder_kwargs)
+        
         return model_kwargs
 
     @staticmethod
@@ -1733,12 +1908,23 @@ class MyBart(BartPretrainedModel):
     def _reorder_cache(past, beam_idx):
         reordered_past = ()
         for layer_past in past:
+            # Fix: Check if layer_past is None
+            if layer_past is None:
+                reordered_past += (None,)
+                continue
+            
             # cached cross_attention states don't have to be reordered -> they are always the same
-            reordered_past += (
-                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:3]) + layer_past[3:],
-            )
+            # Fix: Ensure we have enough elements before slicing
+            if len(layer_past) >= 3:
+                reordered_past += (
+                    tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:3]) + layer_past[3:],
+                )
+            else:
+                # Handle case where layer_past has fewer than 3 elements
+                reordered_past += (
+                    tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),
+                )
         return reordered_past
-
 
 @dataclass
 class MyDataCollatorForSeq2Seq:
@@ -1776,17 +1962,15 @@ class MyDataCollatorForSeq2Seq:
     label_pad_token_id: int = -100
     model_args: object = None
     hash_list = dict()
-    hash_list['cnndm'] = 0
-    hash_list['wiki'] = 1
-    hash_list['pubmed'] = 2
-    hash_list['xsum'] = 3
-    hash_list['arxiv'] = 4
-    hash_list['email'] = 5
-    hash_list['multi'] = 6
-    hash_list['billsum'] = 7
-    hash_list['giga'] = 8
-    hash_list['patent'] =9
-    hash_list['reddit_short'] = 10
+    # Vietnamese hash list
+    hash_list['Văn hóa - Xã hội'] = 0
+    hash_list['Pháp luật'] = 1
+    hash_list['Kinh tế'] = 2
+    hash_list['Khoa học - Công nghệ'] = 3
+    hash_list['Giải trí - Thể thao'] = 4
+    hash_list['Đời sống'] = 5
+    hash_list['Thế giới'] = 6
+    hash_list['Giáo dục'] = 7
 
     def __call__(self, features):
         labels = [feature["labels"] for feature in features] if "labels" in features[0].keys() else None
@@ -1866,6 +2050,8 @@ class LabelSmoother:
 
 class MySeq2SeqTrainer(Seq2SeqTrainer):
     def __init__(self, *args, **kwargs):
+        if 'tokenizer' in kwargs:
+            kwargs['processing_class'] = kwargs.pop('tokenizer')
         super().__init__(*args, **kwargs)
         self.label_smoother = LabelSmoother()
         self.importance_ffn = None
@@ -1897,7 +2083,7 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
 
         return delta, new_lm
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
@@ -1945,38 +2131,55 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
     ) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Perform an evaluation step on :obj:`model` using obj:`inputs`.
-
+    
         Subclass and override to inject custom behavior.
-
+    
         Args:
             model (:obj:`nn.Module`):
                 The model to evaluate.
             inputs (:obj:`Dict[str, Union[torch.Tensor, Any]]`):
                 The inputs and targets of the model.
-
+    
                 The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
                 argument :obj:`labels`. Check your model's documentation for all accepted arguments.
             prediction_loss_only (:obj:`bool`):
                 Whether or not to return the loss only.
-
+    
         Return:
             Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss, logits and
             labels (each being optional).
         """
-
+    
         if not self.args.predict_with_generate or prediction_loss_only:
             return super().prediction_step(
                 model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
             )
         has_labels = "labels" in inputs
         inputs = self._prepare_inputs(inputs)
+        
+        # Fix: Use generation_config instead of non-existent attributes
+        if hasattr(self.model, 'generation_config') and self.model.generation_config is not None:
+            max_length = self.model.generation_config.max_length
+            num_beams = self.model.generation_config.num_beams
+        else:
+            # Fallback values
+            max_length = getattr(self.model.config, 'max_length', 512)
+            num_beams = getattr(self.model.config, 'num_beams', 4)
+        
         gen_kwargs = {
-            "max_length": self._max_length if self._max_length is not None else self.model.config.max_length,
-            "num_beams": self._num_beams if self._num_beams is not None else self.model.config.num_beams,
+            "max_length": max_length,
+            "num_beams": num_beams,
             "repetition_penalty": 2.0,
             "no_repeat_ngram_size": 3,
             "idxes": inputs['idxes'],
-            "length_penalty":0.8
+            "length_penalty": 0.8,
+            # Fix: Add required tokens for generation
+            "decoder_start_token_id": getattr(self.model.config, 'decoder_start_token_id', 
+                                            getattr(self.tokenizer, 'bos_token_id', 0)),
+            "pad_token_id": getattr(self.model.config, 'pad_token_id', 
+                                  getattr(self.tokenizer, 'pad_token_id', 1)),
+            "eos_token_id": getattr(self.model.config, 'eos_token_id', 
+                                  getattr(self.tokenizer, 'eos_token_id', 2))
             # "addi_source_attention_mask": inputs['addi_source_attention_mask'],
         }
         generated_tokens = self.model.generate(
@@ -1988,21 +2191,22 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
         if generated_tokens.shape[-1] < gen_kwargs["max_length"]:
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_length"])
 
+        # Xem lại khi nào dùng autocast ở đây
         # with torch.no_grad():
-        if self.use_amp:
+        if hasattr(self.args, 'fp16') and self.args.fp16:
             with autocast():
                 outputs = model(**inputs)
         else:
             outputs = model(**inputs)
         loss = outputs["loss"]
-
+    
         if self.args.prediction_loss_only:
             return (loss, None, None)
-
+    
         labels = inputs["labels"]
         if labels.shape[-1] < gen_kwargs["max_length"]:
             labels = self._pad_tensors_to_max_len(labels, gen_kwargs["max_length"])
-
+    
         loss = loss.detach()
         # generated_tokens=None
         return (loss, generated_tokens, labels)
